@@ -1,11 +1,11 @@
 import csv
-#import matplotlib.pyplot as plt
-#from matplotlib import path
-#from scipy.spatial import ConvexHull
-#from scipy.interpolate import griddata
-#import cv2
+# import matplotlib.pyplot as plt
+# from matplotlib import path
+# from scipy.spatial import ConvexHull
+# from scipy.interpolate import griddata
+# import cv2
 import itertools
-import time
+#import time
 import os
 
 from netCDF4 import Dataset
@@ -15,27 +15,30 @@ import seissolxdmf
 import trimesh
 import trimesh.proximity
 import trimesh.ray
-from pyembree import rtcore_scene
+import trimesh.viewer
+import trimesh.creation
+import utm
+from pyproj import Transformer
 
 
 def grdwrite(x, y, z, foutput):
     today = datetime.today()
-    #Definimos el dataset y definimos las dimensiones
+    # Definimos el dataset y definimos las dimensiones
     dataset = Dataset(foutput, 'w', format="NETCDF4")
     dataset.createDimension('x', len(x))
     dataset.createDimension('y', len(y))
 
-    #Creamos las variables del dataset
+    # Creamos las variables del dataset
     longitud = dataset.createVariable('x', 'f8', 'x')
     latitud = dataset.createVariable('y', 'f8', 'y')
     valores_interpolados = dataset.createVariable('z', 'f4', ('y', 'x'))
 
-    #Añadimos los datos a las variables creadas
+    # Añadimos los datos a las variables creadas
     longitud[:] = x
     latitud[:] = y
     valores_interpolados[:, :] = z
 
-    #Añadimos informacion general del dataset
+    # Añadimos informacion general del dataset
     dataset.Conventions = " "
     dataset.title = foutput
     dataset.history = "File written using netCDF4 Python module"
@@ -60,15 +63,15 @@ def getBarycentricCoord(pto, vert_a, vert_b, vert_c):
     :param vert_c: vertex c
     :return: list of the three barycentric coordinates of pto respecto to vertex a, vertex b and vertex c
     """
-    ab = vert_b-vert_a
-    ac = vert_c-vert_a
-    ap = pto-vert_a
+    ab = vert_b - vert_a
+    ac = vert_c - vert_a
+    ap = pto - vert_a
 
     normal_ac = [vert_a[1] - vert_c[1], vert_c[0] - vert_a[0]]
     normal_ab = [vert_a[1] - vert_b[1], vert_b[0] - vert_a[0]]
 
-    bary_beta = np.dot(ap, normal_ac)/np.dot(ab, normal_ac)
-    bary_gamma = np.dot(ap, normal_ab)/np.dot(ac, normal_ab)
+    bary_beta = np.dot(ap, normal_ac) / np.dot(ab, normal_ac)
+    bary_gamma = np.dot(ap, normal_ab) / np.dot(ac, normal_ab)
     bary_alpha = 1.000 - bary_beta - bary_gamma
 
     return [bary_alpha, bary_beta, bary_gamma]
@@ -83,10 +86,10 @@ def generateMesh3DfromSeissol(path2SeissolOutput):
     :return: trimesh 3d object
     """
     sx = seissolxdmf.seissolxdmf(path2SeissolOutput)
-    nodes_seissol3d = sx.ReadGeometry()     # nodes array
-    faces_seissol3d = sx.ReadConnect()      # connectivity array
+    nodes_seissol3d = sx.ReadGeometry()  # nodes array
+    faces_seissol3d = sx.ReadConnect()  # connectivity array
     mesh3d = trimesh.Trimesh(vertices=nodes_seissol3d,
-                             faces=faces_seissol3d)  # trimesh object
+                             faces=faces_seissol3d, process=False)  # trimesh object
     return mesh3d
 
 
@@ -99,56 +102,77 @@ def generateMesh2DfromSeissol(path2SeissolOutput):
     :return: trimesh 2d-essentially object in the sense that nodes vertical component is 0
     """
     sx = seissolxdmf.seissolxdmf(path2SeissolOutput)
-    nodes_seissol3d = sx.ReadGeometry()     # nodes array
-    faces_seissol3d = sx.ReadConnect()      # connectivity array
+    nodes_seissol3d = sx.ReadGeometry()  # nodes array
+    faces_seissol3d = sx.ReadConnect()  # connectivity array
     N_nodes = len(nodes_seissol3d)
 
-    nodos_seissol2d = np.delete(nodes_seissol3d, 2, 1)     # remove last component
-    nodos_seissol2d = np.c_[nodos_seissol2d, np.zeros(N_nodes)]     # add z=0 to each node to keep working on 3D
+    nodos_seissol2d = np.delete(nodes_seissol3d, 2, 1)  # remove last component
+    nodos_seissol2d = np.c_[nodos_seissol2d, np.zeros(N_nodes)]  # add z=0 to each node to keep working on 3D
 
-    mesh2d = trimesh.Trimesh(vertices=nodos_seissol2d, faces=faces_seissol3d)
+    mesh2d = trimesh.Trimesh(vertices=nodos_seissol2d, faces=faces_seissol3d, process=False)
     return mesh2d
 
 
-def assign_nodes_values(path2SeissolOutput, variable, instant, outputfile=None):
+def mesh2dCRSconversion(mesh2d, meshCRS):
+    """
+    Generate a new 2D mesh in CRS WGS84
+    :param mesh2d:
+    :param meshCRS:
+    :return:
+    """
+    transformer = Transformer.from_crs(meshCRS, "epsg:4326", always_xy=True)
+    nodes_utm = mesh2d.vertices
+    x = nodes_utm[:, 0]
+    y = nodes_utm[:, 1]
+
+    xnew, ynew = transformer.transform(x, y)
+
+    nodes_wgs = np.array([[m, n] for m, n in zip(xnew, ynew)])
+    nodes_wgs = np.c_[nodes_wgs, np.zeros(len(nodes_wgs))]
+
+    mesh2d_wgs = trimesh.Trimesh(vertices=nodes_wgs, faces=mesh2d.faces, process=False)
+
+    return mesh2d_wgs
+
+
+def assign_nodes_values(path2SeissolOutput, mesh3d, variable, instant, outputfile=None):
     """
     This function assigns values to the nodes of a 3D triangular mesh based on a weighted mean using
     the faces areas that contain each node as a vertex
 
     :param path2SeissolOutput: path to the file .xdmf generated by SeisSol. Same folder must contain
                         the files of the vertex and cell information
+    :param mesh3d: trimesh 3d object
     :param variable: string name of one of the variables provided by SeisSol
     :param instant: timestep of the SeisSol output
     :param outputfile: path and name of the output file where the final nodes values are saved. If not provided
                 the name will be "node_values_[variable]_timestep[instant]" and will be saved on the current directory
     :return: .npy file of the assigned values to the nodes
     """
-    sx = seissolxdmf.seissolxdmf(path2SeissolOutput)    # open the SeisSol output to read the variable
+    sx = seissolxdmf.seissolxdmf(path2SeissolOutput)  # open the SeisSol output to read the variable
     values = sx.ReadData(variable)  # read the variable
-    mesh3d = generateMesh3DfromSeissol(path2SeissolOutput)  # generate the trimesh object
     area_triangles = mesh3d.area_faces
     nodes_value = []
     for i in range(0, len(mesh3d.vertices)):
-        shared_faces = mesh3d.vertex_faces[i]    #indices de caras que tienen al nodo_i en comun
-        shared_faces = np.delete(shared_faces, np.where(shared_faces == -1))  #quitamos los indices -1
+        shared_faces = mesh3d.vertex_faces[i]  # indices de caras que tienen al nodo_i en comun
+        shared_faces = np.delete(shared_faces, np.where(shared_faces == -1))  # quitamos los indices -1
         total_shared_area = 0.0
         value_acum = 0.0
         for j in range(0, len(shared_faces)):
-            area_j = area_triangles[shared_faces[j]]    #area de triangulo adyacente
-            v_j = values[instant][shared_faces[j]] #valor de la variable en el instante elegido y en el triangulo
+            area_j = area_triangles[shared_faces[j]]  # area de triangulo adyacente
+            v_j = values[instant][shared_faces[j]]  # valor de la variable en el instante elegido y en el triangulo
             value_acum += v_j * area_j
             total_shared_area += area_j
-        final_node_value = value_acum / total_shared_area   #valor final que asociamos al nodo tras la ponderacion
+        final_node_value = value_acum / total_shared_area  # valor final que asociamos al nodo tras la ponderacion
         nodes_value.append(final_node_value)
-    nodes_value = np.asarray(nodes_value)   #este array contiene los valores para cada nodo
+    nodes_value = np.asarray(nodes_value)  # este array contiene los valores para cada nodo
     if outputfile is None:
         np.save("node_values_{}_timestep{}".format(variable, instant), nodes_value)
         outfile = "node_values_{}_timestep{}.npy".format(variable, instant)
     else:
         np.save(outputfile, nodes_value)
-        outfile = outputfile+".npy"
+        outfile = outputfile + ".npy"
     return outfile
-
 
 
 def interpolate_value(point, mesh2d, nodes_values):
@@ -163,152 +187,231 @@ def interpolate_value(point, mesh2d, nodes_values):
     :param nodes_values: array of dim(Nnodes,) of values associated to the mesh2d nodes
     :return:
     """
-    _, _, face_index = trimesh.proximity.closest_point(mesh2d, point)   # get the face_index where the point is located
-    face_nodes = mesh2d.faces[face_index[0]]   # get the nodes index of the face
+    rays = trimesh.ray.ray_pyembree.RayMeshIntersector(mesh2d)  # ray object from pyembree
+    point[0][2] = -1.  # assign z=-1 to the point for the ray caster to work properly
+    # Next line cast a ray from point in the z direction and get the triangle index that intersects
+    face_index = rays.intersects_first(point, np.array([[0., 0., 1.]]))
+    face_nodes = mesh2d.faces[face_index[0]]  # get the nodes index of the face
     node0_index = face_nodes[0]
     node1_index = face_nodes[1]
     node2_index = face_nodes[2]
-    node0coordinates = mesh2d.vertices[node0_index]     # get cartesian coordinates of node0
-    node1coordinates = mesh2d.vertices[node1_index]     # get cartesian coordinates of node1
-    node2coordinates = mesh2d.vertices[node2_index]     # get cartesian coordinates of node2
+    node0coordinates = mesh2d.vertices[node0_index]  # get cartesian coordinates of node0
+    node1coordinates = mesh2d.vertices[node1_index]  # get cartesian coordinates of node1
+    node2coordinates = mesh2d.vertices[node2_index]  # get cartesian coordinates of node2
 
     # Barycentric coordinates are invariants under plane-projections
-    point = point[0][:-1]                       # remove last component
-    node0coordinates = node0coordinates[:-1]    # remove last component
-    node1coordinates = node1coordinates[:-1]    # remove last component
-    node2coordinates = node2coordinates[:-1]    # remove last component
+    point = point[0][:-1]  # remove last component
+    node0coordinates = node0coordinates[:-1]  # remove last component
+    node1coordinates = node1coordinates[:-1]  # remove last component
+    node2coordinates = node2coordinates[:-1]  # remove last component
     bar_coord = getBarycentricCoord(point, node0coordinates, node1coordinates, node2coordinates)
 
-    v0 = nodes_values[node0_index]      # get the associated value to the node0
-    v1 = nodes_values[node1_index]      # get the associated value to the node1
-    v2 = nodes_values[node2_index]      # get the associated value to the node2
-    interpolated_value = bar_coord[0]*v0 + bar_coord[1]*v1 + bar_coord[2]*v2
+    v0 = nodes_values[node0_index]  # get the associated value to the node0
+    v1 = nodes_values[node1_index]  # get the associated value to the node1
+    v2 = nodes_values[node2_index]  # get the associated value to the node2
+    interpolated_value = bar_coord[0] * v0 + bar_coord[1] * v1 + bar_coord[2] * v2
 
     return interpolated_value
 
 
+def interpolate_pointCloud(points, mesh2d, nodes_values):
+    """
+    This function assign a value to a given 2D point (z=0) within an 2D-essentially mesh (z=0).
+    The assignment is based on a convex linear combination where the coefficients are the point
+    barycentric coordinates and the values are those associated to the nodes of the corresponding triangle that
+    contains the point
+
+    :param points: array of dim(n,3) with last component z=-1. (x,y) coordinates must be located inside the 2D mesh!!
+    :param mesh2d: trimesh triangular mesh object projected onto z=0 (all nodes must have z=0 component)
+    :param nodes_values: array of dim(Nnodes,) of values associated to the mesh2d nodes
+    :return:
+    """
+    rays = trimesh.ray.ray_pyembree.RayMeshIntersector(mesh2d)  # ray object from pyembree
+    # Next line cast a ray from point in the z direction and get the triangle index that intersects
+    face_indexes = rays.intersects_first(points, np.array([[0., 0., 1.]]))  # list of triangles indexes
+    points = np.delete(points, 2, 1)
+    c = 0
+    interpolated_values = []
+    for index in range(0, len(face_indexes)):
+        face_nodes = mesh2d.faces[face_indexes[index]]  # get the nodes index of the face
+        node0_index = face_nodes[0]
+        node1_index = face_nodes[1]
+        node2_index = face_nodes[2]
+        node0coordinates = mesh2d.vertices[node0_index]  # get cartesian coordinates of node0
+        node1coordinates = mesh2d.vertices[node1_index]  # get cartesian coordinates of node1
+        node2coordinates = mesh2d.vertices[node2_index]  # get cartesian coordinates of node2
+
+        # Barycentric coordinates are invariants under plane-projections
+        node0coordinates = node0coordinates[:-1]  # remove last component
+        node1coordinates = node1coordinates[:-1]  # remove last component
+        node2coordinates = node2coordinates[:-1]  # remove last component
+        bar_coord = getBarycentricCoord(points[c], node0coordinates, node1coordinates, node2coordinates)
+
+        v0 = nodes_values[node0_index]  # get the associated value to the node0
+        v1 = nodes_values[node1_index]  # get the associated value to the node1
+        v2 = nodes_values[node2_index]  # get the associated value to the node2
+        interpolated_value = bar_coord[0] * v0 + bar_coord[1] * v1 + bar_coord[2] * v2
+        interpolated_values.append(interpolated_value)
+        c += 1
+    interpolated_values = np.array(interpolated_values)
+
+    return interpolated_values
+
+
+def generate_grd(mesh2d, nodes_values, xres, yres, foutput):
+    SW = mesh2d.bounds[0][:2]   # Lower left corner
+    NE = mesh2d.bounds[1][:2]   # Upper right corner
+
+    x = np.arange(SW[0] + xres / 2., NE[0] - xres / 2., xres)   # partition in x (revisar extremos)
+    y = np.arange(SW[1] + yres / 2, NE[1] - yres / 2., yres)    # partition in y (revisar extremos)
+
+    Nrow = len(y)
+    Ncolumn = len(x)
+
+    points = np.array(list(itertools.product(x, y)))    # Points of the grd to be interpolated
+    points = np.c_[points, (-1) * np.ones(len(points))] # add z=-1 to each point to keep working on 3D
+
+    interpolated_values = interpolate_pointCloud(points, mesh2d, nodes_values)
+    interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+    grdwrite(x, y, interpolated_values, foutput)  # genera el grd final
+    return
 
 
 
 
 
-"""PRIMERA PARTE QUE GUARDA LOS VALORES PONDERAODS EN LOS NODOS"""
-#path2SeissolOutput = 'seissol_files/hdf5_float/Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf'
-#variable = "u1"
-#instant = 1
-#outputfile = r"C:\Users\Alex\PycharmProjects\curso_python\temp"
-#outfile = assign_nodes_values(path2SeissolOutput, variable, instant)
-#print(outfile)
-#outfile = "node_values_u1_timestep1.npy"
-#valores_nodos = np.load(outfile)
+
+"""PRIMERA PARTE QUE GUARDA LOS VALORES PONDERAODS EN LOS NODOS DE LAS VARIABLES u1,u2,u3 EN TODOS LOS INSTANTES"""
+#Aqui se realiza todo el proceso y se genera un grd por variable y por timestep
+#path = r"C:\Users\Alex\PycharmProjects\curso_python\seissol_files\hdf5_float"
+#file = "Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf"
+#path2SeissolOutput = os.path.join(path, file)   # path to SeisSol file
+#sx = seissolxdmf.seissolxdmf(path2SeissolOutput)    # open the SeisSol file
+#ndt = sx.ReadNdt()  # number of time steps
+#mesh3d = generateMesh3DfromSeissol(path2SeissolOutput)  # generate the 3d mesh object
+#variables = ["u1", "u2", "u3"]  # displacement variables
+#for variable in variables:
+#    for t in range(0, ndt):
+#        # generate arrays of node values by interpolation for each variable and each time step
+#        outfile = assign_nodes_values(path2SeissolOutput, mesh3d, variable, t)
 
 
-"""SEGUNDA PARTE QUE ASIGNA UN VALOR A UN PUNTO CUALQUIERA DENTRO DE LA MALLA TRIANGULAR 2D"""
-#punto = np.array([[-30647.46043395,  66107.62537402,   0.0]])
-#mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)
-#a = interpolate_value(punto, mesh2d, valores_nodos)
+#mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)  # generate the 2d mesh object
+#inputcrs = "+proj=tmerc +datum=WGS84 +k=0.9996 +lon_0=26.25 +lat_0=37.75"   # CRS of the input 2d mesh
+#mesh2d_wgs = mesh2dCRSconversion(mesh2d, inputcrs)  # create new 2d mesh with nodes CRS in WGS84
+#nodes_arrays = ["node_values_u3_timestep{}.npy".format(t) for t in range(0, ndt)]  # list of arrays previously generated
+#xres_meters = 500   # desired x resolution in meters for the grd file
+#yres_meters = 500   # desired y resolution in meters for the grd file
+#xres_dd = xres_meters/(3600*30)     # conversion of x resolution to decimal degrees
+#yres_dd = yres_meters/(3600*30)     # conversion of y resolution to decimal degrees
+#for nodes_values in nodes_arrays:
+#    variable = nodes_values.split("_")[2]
+#    timestep = nodes_values.split("_")[3].split(".")[0]
+#    nodes_values = np.load(nodes_values)
+#
+#    # generate the final grd mesh
+#    generate_grd(mesh2d_wgs, nodes_values, xres_dd, yres_dd, "seissol_{}_{}.grd".format(variable, timestep))
+
+
+
+
+#ncfile = "qhysea_order2_avg_vorticeChertock.nc"
+#grdfile = "seissol_u1_timestep0.grd"
+#ds = Dataset(grdfile)
+#print(ds)
+
+xres = 0.00462962962963
+yres = xres
+x = np.arange(26.8323007, 26.9723007, xres)   # partition in x (revisar extremos)
+y = np.arange(37.9517573, 38.0217573, yres)    # partition in y (revisar extremos)
+Nrow = len(y)
+Ncolumn = len(x)
+fn = 'test.nc'
+ds = Dataset(fn, 'w', format='NETCDF4')
+time = ds.createDimension('time', None)
+lat = ds.createDimension('y', Nrow)
+lon = ds.createDimension('x', Ncolumn)
+times = ds.createVariable('time', 'f8', 'time')
+longitude = ds.createVariable('x', 'f8', 'x')
+latitude = ds.createVariable('y', 'f8', 'y')
+u1 = ds.createVariable('u1', 'f8', ('time', 'y', 'x'))
+u2 = ds.createVariable('u2', 'f8', ('time', 'y', 'x'))
+u3 = ds.createVariable('u3', 'f8', ('time', 'y', 'x'))
+longitude.units = "degrees east"
+latitude.units = "degrees north"
+u1.units = "meters"
+u2.units = "meters"
+u3.units = "meters"
+times.units = "time step"
+longitude[:] = x
+latitude[:] = y
+
+
+#today = datetime.today()
+## Definimos el dataset y definimos las dimensiones
+#dataset = Dataset(foutput, 'w', format="NETCDF4")
+#dataset.createDimension('x', len(x))
+#dataset.createDimension('y', len(y))#
+## Creamos las variables del dataset
+#longitud = dataset.createVariable('x', 'f8', 'x')
+#latitud = dataset.createVariable('y', 'f8', 'y')
+#valores_interpolados = dataset.createVariable('z', 'f4', ('y', 'x'))#
+## Añadimos los datos a las variables creadas
+#longitud[:] = x
+#latitud[:] = y
+#valores_interpolados[:, :] = z
+## Añadimos informacion general del dataset
+#dataset.Conventions = " "
+#dataset.title = foutput
+#dataset.history = "File written using netCDF4 Python module"
+#dataset.description = "Created " + today.strftime("%d/%m/%y")
+#dataset.GMT_version = "6.1.0"
+#longitud.units = "degrees east"
+#latitud.units = "degrees north"
+#valores_interpolados.units = 'meters'#
+#dataset.close()
+
+
+
+
+
+
+
+"""ESTO COMPRUEBA QUE UN PUNTO ESTA EN SU SITIO BIEN INTERPOLADO"""
+#valores_nodos = np.load("node_values_u1_timestep2.npy")
+#mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)  # generate the 2d mesh object
+#inputcrs = "+proj=tmerc +datum=WGS84 +k=0.9996 +lon_0=26.25 +lat_0=37.75"   # CRS of the input 2d mesh
+#mesh2d_wgs = mesh2dCRSconversion(mesh2d, inputcrs)  # create new 2d mesh with nodes CRS in WGS84
+#
+#point = np.array([[26.8323007, 38.0217573, -1.]])
+#a=interpolate_value(point, mesh2d_wgs, valores_nodos)
 #print(a)
 
 
-"""
-Solo quedaria iterar sobre un conjunto de puntos dados para interpolar y generar una
-malla rectangular formada por los valores {(punto,valor_interpolado)}
-"""
 
-
-
-
-
-path2SeissolOutput = 'seissol_files/hdf5_float/Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf'
-valores_nodos = np.load("node_values_u1_timestep1.npy")
-
-punto = np.array([[-30647.46043395,  66107.62537402,   -1.0]])
-mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)
-
-start_time = time.time()
-rays = trimesh.ray.ray_pyembree.RayMeshIntersector(mesh2d) #ESTA ES LA BUENA!!!
-a = rays.intersects_first(punto, np.array([[0., 0., 1.]]))
-print(a)
-print(time.time() - start_time)
-
-#start_time = time.time()
-#_, _, face_index = trimesh.proximity.closest_point(mesh2d, punto)   # get the face_index where the point is located
-#print(time.time() - start_time)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-"""Esto define la malla rectangular"""
-#x=np.arange(xmin,xmax,1000.0)
-#y=np.arange(ymin,ymax,1000.0)
-#X, Y = np.meshgrid(x,y)
-
-
-
-#for i in range(0,N_nodos):
-#for i in range(0,4):
-#    celdas_conectadas = []
-#    for k in range(0,N_celdas):
-#        if i in connect[k]:
-#            celdas_conectadas.append(k)
-#    print("Los triangulos conectados al nodo {} son {}".format(i,celdas_conectadas))
-#    area=0
-#    valor=0
-#    for j in celdas_conectadas:
-#        area_j = dic_areas[j]
-#        valor_j = ____[j]
-#        area += area_j
-#        valor+= valor_j*area_j
-#    valor=valor/area
-
-
-
-#geomX, geomY = np.meshgrid(geomx, geomy)
-#print(geomX)
-#pts_grosera_inicial = np.array(list(itertools.product(G.x,G.y)))
-#ptos_grosera_rect = pts_grosera_inicial[in_rect]    #Puntos de la grosera dentro del rectangulo (por columnas)
-#valores_grosera_rect = G.Z.T.flatten()[in_rect]     #Valores de la grosera dentro del rectangulo (por columnas)
+"""PARA PINTAR"""
+## Esto reescalada la malla para meterla en un cubo
+# mesh=mesh2d
+# rescale = max(mesh.extents) / 2.
+# tform = [-(mesh.bounds[1][i] + mesh.bounds[0][i]) / 2. for i in range(3)]
+# matrix = np.eye(4)
+# matrix[:3, 3] = tform
+# mesh.apply_transform(matrix)
+# matrix = np.eye(4)
+# matrix[:3, :3] /= rescale
+# mesh.apply_transform(matrix)
 #
-#
-#ZZc = griddata(ptos_grosera_rect, valores_grosera_rect, (X, Y), 'linear')
+## Esto renderiza la escena
+# scene = trimesh.Scene([mesh])
+# viewer = trimesh.viewer.windowed.SceneViewer(scene, flags='wireframe')
+
+
+
+"""PARA EXPORTAR UNA MALLA"""
+#mesh = generateMesh2DfromSeissol(file)
+#mesh.export('new_mesh.stl')
+
+
+
 
 
