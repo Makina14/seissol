@@ -10,15 +10,15 @@ fn_binary_double = 'seissol_files/raw_double/Fra_v4_noWL_raw_double_25s_50s-surf
 
 
 # initiate class
-sx = seissolxdmf.seissolxdmf(fn_hdf5_float)
+sx = seissolxdmf.seissolxdmf(fn_hdf5_single)
 #print(sx.tree)
 
 
 print("\n")
-print("El fichero base es: {}".format(fn_hdf5_float.split("/")[-1]))
+print("El fichero base es: {}".format(fn_hdf5_single.split("/")[-1]))
 print("Los campos disponibles en el fichero son: ")
 print(sx.ReadAvailableDataFields())
-variable = "u1"
+variable = "locationFlag"
 
 
 # Number of cells
@@ -70,7 +70,8 @@ print("Esto es un array de todas las celdas, donde cada celda \ntiene {} arrays,
 v1s = sx.ReadData(variable)
 print("La variable {} tiene estos valores:".format(variable))
 print(v1s)
-
+print(len(v1s))
+print(len(v1s[0]))
 
 # load the 8th time ste of the v1s array as a numpy array of shape (nElements)
 print("\n")
@@ -78,6 +79,7 @@ print("Podemos extraer todos los valores en un instante de tiempo concreto.")
 print("Los valores de {} en el timestep={} son:".format(variable,ndt))
 v1s_t = sx.ReadData(variable, ndt-1)
 print(v1s_t)
+
 
 
 """AHORA TRASTEAMOS CON LOS DATOS"""

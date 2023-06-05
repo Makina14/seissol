@@ -7,6 +7,7 @@ import csv
 import itertools
 #import time
 import os
+import glob
 
 from netCDF4 import Dataset
 import numpy as np
@@ -19,6 +20,7 @@ import trimesh.viewer
 import trimesh.creation
 import utm
 from pyproj import Transformer
+import rasterio
 
 
 def grdwrite(x, y, z, foutput):
@@ -166,8 +168,10 @@ def assign_nodes_values(path2SeissolOutput, mesh3d, variable, instant, outputfil
         final_node_value = value_acum / total_shared_area  # valor final que asociamos al nodo tras la ponderacion
         nodes_value.append(final_node_value)
     nodes_value = np.asarray(nodes_value)  # este array contiene los valores para cada nodo
+    if not os.path.exists("nodes_arrays"):
+        os.mkdir("nodes_arrays")
     if outputfile is None:
-        np.save("node_values_{}_timestep{}".format(variable, instant), nodes_value)
+        np.save("nodes_arrays/node_values_{}_timestep{}".format(variable, instant), nodes_value)
         outfile = "node_values_{}_timestep{}.npy".format(variable, instant)
     else:
         np.save(outputfile, nodes_value)
@@ -258,18 +262,16 @@ def interpolate_pointCloud(points, mesh2d, nodes_values):
     return interpolated_values
 
 
-def generate_grd(mesh2d, nodes_values, xres, yres, foutput):
-    SW = mesh2d.bounds[0][:2]   # Lower left corner
-    NE = mesh2d.bounds[1][:2]   # Upper right corner
-
-    x = np.arange(SW[0] + xres / 2., NE[0] - xres / 2., xres)   # partition in x (revisar extremos)
-    y = np.arange(SW[1] + yres / 2, NE[1] - yres / 2., yres)    # partition in y (revisar extremos)
+def generate_grd(mesh2d, nodes_values, xres, yres, sw, ne, foutput):
+    eps = 4.0e-5
+    x = np.arange(sw[0] + eps, ne[0] - eps, xres)  # partition in x (revisar extremos)
+    y = np.arange(sw[1] + eps, ne[1] - eps, yres)  # partition in y (revisar extremos)
 
     Nrow = len(y)
     Ncolumn = len(x)
 
-    points = np.array(list(itertools.product(x, y)))    # Points of the grd to be interpolated
-    points = np.c_[points, (-1) * np.ones(len(points))] # add z=-1 to each point to keep working on 3D
+    points = np.array(list(itertools.product(x, y)))        # Points of the grd to be interpolated
+    points = np.c_[points, (-1) * np.ones(len(points))]     # add z=-1 to each point to keep working on 3D
 
     interpolated_values = interpolate_pointCloud(points, mesh2d, nodes_values)
     interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
@@ -277,99 +279,288 @@ def generate_grd(mesh2d, nodes_values, xres, yres, foutput):
     return
 
 
+def wgs_boundaries(sw, ne, inputcrs):
+    xmin = sw[0]
+    xmax = ne[0]
+    ymin = sw[1]
+    ymax = ne[1]
+
+    transformer = Transformer.from_crs(inputcrs, "epsg:4326", always_xy=True)
+    xLL, yLL = transformer.transform(xmin, ymin)
+    xUL, yUL = transformer.transform(xmin, ymax)
+    xLR, yLR = transformer.transform(xmax, ymin)
+    xUR, yUR = transformer.transform(xmax, ymax)
+
+    LL = [xLL, yLL]
+    UL = [xUL, yUL]
+
+    LR = [xLR, yLR]
+    UR = [xUR, yUR]
+
+    return LL, UL, LR, UR
+
+
+def hysea_mesh_corners(mesh2d, inputcrs):
+    sw = mesh2d.bounds[0][:2]  # Lower left corner
+    ne = mesh2d.bounds[1][:2]  # Upper right corner
+
+    transformer = Transformer.from_crs(inputcrs, "epsg:4326", always_xy=True)
+
+    x = np.arange(sw[0], ne[0], 1)
+    y = np.arange(sw[1], ne[1], 1)
+
+    y_lowerRow = np.repeat(sw[1], len(x))
+    xnew, ynew = transformer.transform(x, y_lowerRow)
+    ymin = max(ynew)
+
+    y_upperRow = np.repeat(ne[1], len(x))
+    xnew, ynew = transformer.transform(x, y_upperRow)
+    ymax = min(ynew)
+
+    x_leftColumn = np.repeat(sw[0], len(y))
+    xnew, ynew = transformer.transform(x_leftColumn, y)
+    xmin = max(xnew)
+
+    x_rightColumn = np.repeat(ne[0], len(y))
+    xnew, ynew = transformer.transform(x_rightColumn, y)
+    xmax = min(xnew)
+
+    SW_new = [xmin, ymin]
+    NE_new = [xmax, ymax]
+
+    return SW_new, NE_new
+
+
+def seissol2hysea(path2SeissolOutput, seissolevent_crs, outx_resolution, outy_resolution, outnetcdf):
+    sx = seissolxdmf.seissolxdmf(path2SeissolOutput)  # open the SeisSol file
+    ndt = sx.ReadNdt()  # number of time steps
+    variables = ["u1", "u2", "u3"]
+    if not os.path.exists("nodes_arrays"):
+        # Generate the arrays containing the variables values assigned to the nodes in case they don't exist
+        mesh3d = generateMesh3DfromSeissol(path2SeissolOutput)
+        for variable in variables:
+            for t in range(0, ndt):
+                # generate arrays of node values by interpolation for each variable and each time step
+                print("generating array of nodes values for {}-timestep {}".format(variable, t))
+                assign_nodes_values(path2SeissolOutput, mesh3d, variable, t)
+        print("All intermediate arrays have been generated successfully")
+    else:
+        if len(os.listdir("nodes_arrays/") == len(variables)*ndt):
+            print("All nodes values arrays already exist")
+        else:
+            print("Some arrays are missing. Need to generate them again.")
+
+    mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)      # generate the 2d mesh object
+    mesh2d_wgs = mesh2dCRSconversion(mesh2d, seissolevent_crs)  # create new 2d mesh with nodes CRS in WGS84
+
+    # Now define the structured mesh for HySEA
+    SW, NE = hysea_mesh_corners(mesh2d, seissolevent_crs)   # Corners of the resulting meshes
+    eps = 4.0e-5    # little quantity to generate points within the SeisSol mesh (it is ~5m)
+    x = np.arange(SW[0]+eps, NE[0]-eps, outx_resolution)   # partition in x (revisar extremos)
+    y = np.arange(SW[1]+eps, NE[1]-eps, outy_resolution)    # partition in y (revisar extremos)
+    Nrow = len(y)
+    Ncolumn = len(x)
+    points = np.array(list(itertools.product(x, y)))        # Points of the grd to be interpolated
+    points = np.c_[points, (-1) * np.ones(len(points))]     # add z=-1 to each point to keep working on 3D
+
+    # Now create the netCDF file and fill it
+    ds = Dataset(outnetcdf, 'w', format='NETCDF4')
+    ds.title = "SeisSol model outputs converted from triangular mesh to structured mesh by interpolation"
+    ds.history = "File written using netCDF4 Python module"
+    today = datetime.today()
+    ds.description = "Created " + today.strftime("%d/%m/%y")
+    time = ds.createDimension('time', None)
+    lat = ds.createDimension('y', Nrow)
+    lon = ds.createDimension('x', Ncolumn)
+    times = ds.createVariable('time', 'f4', ('time',))
+    longitude = ds.createVariable('x', 'f8', ('x',))
+    latitude = ds.createVariable('y', 'f8', ('y',))
+    u1 = ds.createVariable('u1', 'f8', ('time', 'y', 'x'))
+    u2 = ds.createVariable('u2', 'f8', ('time', 'y', 'x'))
+    u3 = ds.createVariable('u3', 'f8', ('time', 'y', 'x'))
+    longitude.units = "degrees east (WGS84)"
+    latitude.units = "degrees north (WGS84)"
+    u1.units = "meters"
+    u2.units = "meters"
+    u3.units = "meters"
+    times.units = "time step"
+    longitude[:] = x
+    latitude[:] = y
+    for t in range(0, ndt):
+        # Include u1
+        print("including variable u1-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u1_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u1[t, :, :] = interpolated_values
+        del nodes_values
+
+        # Include u2
+        print("including variable u2-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u2_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u2[t, :, :] = interpolated_values
+        del nodes_values
+
+        # Include u3
+        print("including variable u3-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u3_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u3[t, :, :] = interpolated_values
+        del nodes_values
+
+    ds.close()
+    return
 
 
 
 
-"""PRIMERA PARTE QUE GUARDA LOS VALORES PONDERAODS EN LOS NODOS DE LAS VARIABLES u1,u2,u3 EN TODOS LOS INSTANTES"""
-#Aqui se realiza todo el proceso y se genera un grd por variable y por timestep
-#path = r"C:\Users\Alex\PycharmProjects\curso_python\seissol_files\hdf5_float"
-#file = "Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf"
-#path2SeissolOutput = os.path.join(path, file)   # path to SeisSol file
-#sx = seissolxdmf.seissolxdmf(path2SeissolOutput)    # open the SeisSol file
-#ndt = sx.ReadNdt()  # number of time steps
-#mesh3d = generateMesh3DfromSeissol(path2SeissolOutput)  # generate the 3d mesh object
-#variables = ["u1", "u2", "u3"]  # displacement variables
-#for variable in variables:
-#    for t in range(0, ndt):
-#        # generate arrays of node values by interpolation for each variable and each time step
-#        outfile = assign_nodes_values(path2SeissolOutput, mesh3d, variable, t)
+def seissol2hysea_given(path2SeissolOutput, seissolevent_crs, outx_resolution, outy_resolution, outnetcdf, xy_points=None):
+    sx = seissolxdmf.seissolxdmf(path2SeissolOutput)  # open the SeisSol file
+    ndt = sx.ReadNdt()  # number of time steps
+    variables = ["u1", "u2", "u3"]
+    if not os.path.exists("nodes_arrays"):
+        # Generate the arrays containing the variables values assigned to the nodes in case they don't exist
+        mesh3d = generateMesh3DfromSeissol(path2SeissolOutput)
+        for variable in variables:
+            for t in range(0, ndt):
+                # generate arrays of node values by interpolation for each variable and each time step
+                print("generating array of nodes values for {}-timestep {}".format(variable, t))
+                assign_nodes_values(path2SeissolOutput, mesh3d, variable, t)
+        print("All intermediate arrays have been generated successfully")
+    else:
+        if len(os.listdir("nodes_arrays/")) == len(variables)*ndt:
+            print("All nodes values arrays already exist")
+        else:
+            print("Some arrays are missing. Need to generate them again.")
+
+    mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)      # generate the 2d mesh object
+    mesh2d_wgs = mesh2dCRSconversion(mesh2d, seissolevent_crs)  # create new 2d mesh with nodes CRS in WGS84
+
+    # Now define the structured mesh for HySEA
+    if xy_points != None:
+        # Set of points provided by the user
+        extension = xy_points.split(".")[-1]
+        if extension in ["nc", "grd"]:
+            ds = Dataset(xy_points)
+            var_names = list(ds.variables.keys())
+            xaxis = ["lon", "x", "longitude"]
+            yaxis = ["lat", "y", "latitude"]
+            for namex in var_names:
+                if namex in xaxis:
+                    x = ds[namex][:]
+            for namey in var_names:
+                if namey in yaxis:
+                    y = ds[namey][:]
+            ds.close()
+        elif extension == "tif":
+            ds = rasterio.open(xy_points)
+            band1 = ds.read(1)
+            height = band1.shape[0]
+            width = band1.shape[1]
+            cols, rows = np.meshgrid(np.arange(width), np.arange(height))
+            xs, ys = rasterio.transform.xy(ds.transform, rows, cols)
+            x = np.array(xs[0])
+            y = np.array(ys)[::-1][:, 0]
+            ds.close()
+        else:
+            print("Points file format not recognized. It should be .nc, .grd or .tif")
+
+    else:
+        # Set of points that best fit within the triangular mesh. Resolutions provided by the user.
+        SW, NE = hysea_mesh_corners(mesh2d, seissolevent_crs)   # Corners of the resulting meshes
+        eps = 4.0e-5    # little quantity to generate points within the SeisSol mesh (it is ~5m)
+        x = np.arange(SW[0]+eps, NE[0]-eps, outx_resolution)   # partition in x (revisar extremos)
+        y = np.arange(SW[1]+eps, NE[1]-eps, outy_resolution)    # partition in y (revisar extremos)
+
+    Nrow = len(y)
+    Ncolumn = len(x)
+    points = np.array(list(itertools.product(x, y)))  # Points of the grd to be interpolated
+    points = np.c_[points, (-1) * np.ones(len(points))]  # add z=-1 to each point to keep working on 3D
+
+    # Now create the netCDF file and fill it
+    ds = Dataset(outnetcdf, 'w', format='NETCDF4')
+    ds.title = "SeisSol model outputs converted from triangular mesh to structured mesh by interpolation"
+    ds.history = "File written using netCDF4 Python module"
+    today = datetime.today()
+    ds.description = "Created " + today.strftime("%d/%m/%y")
+    time = ds.createDimension('time', None)
+    lat = ds.createDimension('y', Nrow)
+    lon = ds.createDimension('x', Ncolumn)
+    times = ds.createVariable('time', 'f4', ('time',))
+    longitude = ds.createVariable('x', 'f8', ('x',))
+    latitude = ds.createVariable('y', 'f8', ('y',))
+    u1 = ds.createVariable('u1', 'f8', ('time', 'y', 'x'))
+    u2 = ds.createVariable('u2', 'f8', ('time', 'y', 'x'))
+    u3 = ds.createVariable('u3', 'f8', ('time', 'y', 'x'))
+    longitude.units = "degrees east (WGS84)"
+    latitude.units = "degrees north (WGS84)"
+    u1.units = "meters"
+    u2.units = "meters"
+    u3.units = "meters"
+    times.units = "time step"
+    longitude[:] = x
+    latitude[:] = y
+    for t in range(0, 2):
+        # Include u1
+        print("including variable u1-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u1_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u1[t, :, :] = interpolated_values
+        del nodes_values
+
+        # Include u2
+        print("including variable u2-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u2_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u2[t, :, :] = interpolated_values
+        del nodes_values
+
+        # Include u3
+        print("including variable u3-timestep{} in netCDF".format(t))
+        array = os.path.join("nodes_arrays", "node_values_u3_timestep{}.npy".format(t))
+        nodes_values = np.load(array)
+        interpolated_values = interpolate_pointCloud(points, mesh2d_wgs, nodes_values)
+        interpolated_values = interpolated_values.reshape(Ncolumn, Nrow).T
+        u3[t, :, :] = interpolated_values
+        del nodes_values
+
+    ds.close()
+    return
 
 
-#mesh2d = generateMesh2DfromSeissol(path2SeissolOutput)  # generate the 2d mesh object
-#inputcrs = "+proj=tmerc +datum=WGS84 +k=0.9996 +lon_0=26.25 +lat_0=37.75"   # CRS of the input 2d mesh
-#mesh2d_wgs = mesh2dCRSconversion(mesh2d, inputcrs)  # create new 2d mesh with nodes CRS in WGS84
-#nodes_arrays = ["node_values_u3_timestep{}.npy".format(t) for t in range(0, ndt)]  # list of arrays previously generated
-#xres_meters = 500   # desired x resolution in meters for the grd file
-#yres_meters = 500   # desired y resolution in meters for the grd file
-#xres_dd = xres_meters/(3600*30)     # conversion of x resolution to decimal degrees
-#yres_dd = yres_meters/(3600*30)     # conversion of y resolution to decimal degrees
-#for nodes_values in nodes_arrays:
-#    variable = nodes_values.split("_")[2]
-#    timestep = nodes_values.split("_")[3].split(".")[0]
-#    nodes_values = np.load(nodes_values)
-#
-#    # generate the final grd mesh
-#    generate_grd(mesh2d_wgs, nodes_values, xres_dd, yres_dd, "seissol_{}_{}.grd".format(variable, timestep))
+
+
+#EXAMPLE
+path = r"C:\Users\Alex\PycharmProjects\curso_python\seissol_files\hdf5_float"
+file = "Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf"
+path2SeissolOutput = os.path.join(path, file)   # path to SeisSol file
+
+inputcrs = "+proj=tmerc +datum=WGS84 +k=0.9996 +lon_0=26.25 +lat_0=37.75"   # CRS of the input 2d mesh
+xres_meters = 500   # desired x resolution in meters for the nc file
+yres_meters = 500   # desired y resolution in meters for the nc file
+xres_dd = xres_meters/(3600*30)     # conversion of x resolution to decimal degrees
+yres_dd = yres_meters/(3600*30)     # conversion of y resolution to decimal degrees
+
+#seissol2hysea(path2SeissolOutput, inputcrs, xres_dd, yres_dd, "test_def2.nc")
+seissol2hysea_given(path2SeissolOutput, inputcrs, xres_dd, yres_dd, "test_contif.nc", xy_points="clipped_tif.tif")
 
 
 
 
-#ncfile = "qhysea_order2_avg_vorticeChertock.nc"
-#grdfile = "seissol_u1_timestep0.grd"
-#ds = Dataset(grdfile)
-#print(ds)
-
-xres = 0.00462962962963
-yres = xres
-x = np.arange(26.8323007, 26.9723007, xres)   # partition in x (revisar extremos)
-y = np.arange(37.9517573, 38.0217573, yres)    # partition in y (revisar extremos)
-Nrow = len(y)
-Ncolumn = len(x)
-fn = 'test.nc'
-ds = Dataset(fn, 'w', format='NETCDF4')
-time = ds.createDimension('time', None)
-lat = ds.createDimension('y', Nrow)
-lon = ds.createDimension('x', Ncolumn)
-times = ds.createVariable('time', 'f8', 'time')
-longitude = ds.createVariable('x', 'f8', 'x')
-latitude = ds.createVariable('y', 'f8', 'y')
-u1 = ds.createVariable('u1', 'f8', ('time', 'y', 'x'))
-u2 = ds.createVariable('u2', 'f8', ('time', 'y', 'x'))
-u3 = ds.createVariable('u3', 'f8', ('time', 'y', 'x'))
-longitude.units = "degrees east"
-latitude.units = "degrees north"
-u1.units = "meters"
-u2.units = "meters"
-u3.units = "meters"
-times.units = "time step"
-longitude[:] = x
-latitude[:] = y
 
 
-#today = datetime.today()
-## Definimos el dataset y definimos las dimensiones
-#dataset = Dataset(foutput, 'w', format="NETCDF4")
-#dataset.createDimension('x', len(x))
-#dataset.createDimension('y', len(y))#
-## Creamos las variables del dataset
-#longitud = dataset.createVariable('x', 'f8', 'x')
-#latitud = dataset.createVariable('y', 'f8', 'y')
-#valores_interpolados = dataset.createVariable('z', 'f4', ('y', 'x'))#
-## Añadimos los datos a las variables creadas
-#longitud[:] = x
-#latitud[:] = y
-#valores_interpolados[:, :] = z
-## Añadimos informacion general del dataset
-#dataset.Conventions = " "
-#dataset.title = foutput
-#dataset.history = "File written using netCDF4 Python module"
-#dataset.description = "Created " + today.strftime("%d/%m/%y")
-#dataset.GMT_version = "6.1.0"
-#longitud.units = "degrees east"
-#latitud.units = "degrees north"
-#valores_interpolados.units = 'meters'#
-#dataset.close()
+
+
 
 
 
