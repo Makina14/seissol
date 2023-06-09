@@ -3,22 +3,22 @@ import seissolxdmf
 
 
 
-
+fn_binary_double = 'seissol_files/raw_double/Fra_v4_noWL_raw_double_25s_50s-surface.xdmf'
 fn_hdf5_float = 'seissol_files/hdf5_float/Fra_v4_noWL_hdf5_float_2.5s_50s-surface.xdmf'
 fn_hdf5_single = 'seissol_files/hdf5_single/Fra_v4_WL_hdf5_single_WL_50s-surface.xdmf'
-fn_binary_double = 'seissol_files/raw_double/Fra_v4_noWL_raw_double_25s_50s-surface.xdmf'
+
 
 
 # initiate class
-sx = seissolxdmf.seissolxdmf(fn_hdf5_single)
+sx = seissolxdmf.seissolxdmf(fn_hdf5_float)
 #print(sx.tree)
 
 
 print("\n")
-print("El fichero base es: {}".format(fn_hdf5_single.split("/")[-1]))
+print("El fichero base es: {}".format(fn_hdf5_float.split("/")[-1]))
 print("Los campos disponibles en el fichero son: ")
 print(sx.ReadAvailableDataFields())
-variable = "locationFlag"
+variable = "u1"
 
 
 # Number of cells
